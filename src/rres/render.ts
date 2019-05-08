@@ -15,7 +15,8 @@ import { GfxBufferCoalescer } from '../gfx/helpers/BufferHelpers';
 import { nArray } from '../util';
 import { prepareFrameDebugOverlayCanvas2D, getDebugOverlayCanvas2D, drawWorldSpaceLine } from '../DebugJunk';
 import { colorCopy } from '../Color';
-import { computeNormalMatrix } from '../MathHelpers';
+import { computeNormalMatrix } from '../MatrixHelpers';
+import { MaterialInstanceState } from "../j3d/render";
 
 export class RRESTextureHolder extends GXTextureHolder<BRRES.TEX0> {
     public addRRESTextures(device: GfxDevice, rres: BRRES.RRES): void {
@@ -257,7 +258,7 @@ class MaterialInstance {
         mat4.mul(dstPost, matrixScratch, dstPost);
     }
 
-    public fillMaterialParams(materialParams: MaterialParams, textureHolder: GXTextureHolder, modelMatrix: mat4, viewerInput: ViewerRenderInput): void {
+    public fillMaterialParams(materialParams: MaterialParams, materialInstanceState: MaterialInstanceState, textureHolder: GXTextureHolder, modelMatrix: mat4, viewerInput: ViewerRenderInput): void {
         const material = this.materialData.material;
 
         for (let i = 0; i < 8; i++) {
@@ -309,6 +310,9 @@ class MaterialInstance {
         calcColor(ColorKind.C0, material.colorRegisters[1], BRRES.AnimatableColor.C0);
         calcColor(ColorKind.C1, material.colorRegisters[2], BRRES.AnimatableColor.C1);
         calcColor(ColorKind.C2, material.colorRegisters[3], BRRES.AnimatableColor.C2);
+        
+        for (let i = 0; i < materialInstanceState.lights.length; i++)
+            materialParams.u_Lights[i].copy(materialInstanceState.lights[i]);
     }
 
     private fillTextureMapping(dst: TextureMapping, textureHolder: GXTextureHolder, i: number): void {
@@ -323,8 +327,8 @@ class MaterialInstance {
         dst.gfxSampler = this.materialData.gfxSamplers[i];
     }
 
-    public prepareToRender(renderHelper: GXRenderHelperGfx, textureHolder: GXTextureHolder, modelMatrix: mat4, viewerInput: ViewerRenderInput): void {
-        this.fillMaterialParams(this.materialParams, textureHolder, modelMatrix, viewerInput);
+    public prepareToRender(renderHelper: GXRenderHelperGfx, textureHolder: GXTextureHolder, modelMatrix: mat4, viewerInput: ViewerRenderInput, materialInstanceState: MaterialInstanceState): void {
+        this.fillMaterialParams(this.materialParams, materialInstanceState, textureHolder, modelMatrix, viewerInput);
         this.templateRenderInst.setSamplerBindingsFromTextureMappings(this.materialParams.m_TextureMapping);
         this.materialHelper.fillMaterialParams(this.materialParams, renderHelper);
     }
@@ -339,6 +343,7 @@ const scratchVec3a = vec3.create();
 const scratchVec3b = vec3.create();
 export class MDL0ModelInstance {
     private shapeInstances: ShapeInstance[] = [];
+    private materialInstanceState = new MaterialInstanceState();
     private materialInstances: MaterialInstance[] = [];
     private chr0NodeAnimator: BRRES.CHR0NodesAnimator;
 
@@ -488,7 +493,7 @@ export class MDL0ModelInstance {
             this.templateRenderInst.passMask = this.passMask;
 
             for (let i = 0; i < this.materialInstances.length; i++)
-                this.materialInstances[i].prepareToRender(renderHelper, this.textureHolder, this.modelMatrix, viewerInput);
+                this.materialInstances[i].prepareToRender(renderHelper, this.textureHolder, this.modelMatrix, viewerInput, this.materialInstanceState);
 
             const rootJoint = mdl0.nodes[0];
             if (rootJoint.bbox != null) {
@@ -603,6 +608,15 @@ export class MDL0ModelInstance {
                 mat4.mul(matrixScratchArray[op.mtxId], this.matrixArray[op.mtxId], node.inverseBindPose);
             }
         }
+    }
+    /**
+     * Returns the {@link GX_Material.Light} at index {@param i} as used by this model instance.
+     *
+     * This object is not a copy; setting parameters on this object will directly affect
+     * the render for the next frame.
+     */
+    public getGXLightReference(i: number): GX_Material.Light {
+        return this.materialInstanceState.lights[i];
     }
 }
 

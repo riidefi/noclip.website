@@ -11,14 +11,18 @@ import { assert, readString, hexzero, assertExists } from '../util';
 import { fetchData } from '../fetch';
 import Progressable from '../Progressable';
 import ArrayBufferSlice from '../ArrayBufferSlice';
-import { mat4 } from 'gl-matrix';
+import { mat4, vec3 } from 'gl-matrix';
 import { RRESTextureHolder, MDL0Model, MDL0ModelInstance } from './render';
 import AnimationController from '../AnimationController';
 import { GXRenderHelperGfx } from '../gx/gx_render';
+import { EFB_WIDTH, EFB_HEIGHT, Light, lightSetWorldPosition, lightSetWorldDirection, Color } from '../gx/gx_material';
 import { GfxDevice, GfxHostAccessPass, GfxRenderPass } from '../gfx/platform/GfxPlatform';
 import { GfxRenderInstViewRenderer } from '../gfx/render/GfxRenderer';
 import { BasicRenderTarget, transparentBlackFullClearRenderPassDescriptor } from '../gfx/helpers/RenderTargetHelpers';
-import { computeModelMatrixSRT, MathConstants } from '../MathHelpers';
+import { calcModelMtx } from '../oot3d/cmb';
+import { fillVec3 } from '../gfx/helpers/UniformBufferHelpers';
+import { colorNew, colorFromRGBA } from '../Color';
+import { Camera } from '../Camera';
 
 const enum MKWiiPass { MAIN = 0x01 }
 
@@ -57,6 +61,7 @@ class MarioKartWiiRenderer implements Viewer.SceneGfx {
 
     public modelInstances: MDL0ModelInstance[] = [];
     public modelCache = new ModelCache();
+    public LightManager : EGGLightManager;
 
     constructor(device: GfxDevice) {
         this.renderHelper = new GXRenderHelperGfx(device);
@@ -86,8 +91,14 @@ class MarioKartWiiRenderer implements Viewer.SceneGfx {
 
     protected prepareToRender(hostAccessPass: GfxHostAccessPass, viewerInput: Viewer.ViewerRenderInput): void {
         this.renderHelper.fillSceneParams(viewerInput);
+
         for (let i = 0; i < this.modelInstances.length; i++)
+        {
             this.modelInstances[i].prepareToRender(this.renderHelper, viewerInput);
+            // TODO(riidefi): Not sure on special object lighting
+            this.LightManager.setOnModelInstance(this.modelInstances[i], viewerInput.camera);
+        }
+
         this.renderHelper.prepareToRender(hostAccessPass);
     }
 
@@ -165,9 +176,9 @@ function parseKMP(buffer: ArrayBufferSlice): KMP {
         const translationX = view.getFloat32(gobjTableIdx + 0x04);
         const translationY = view.getFloat32(gobjTableIdx + 0x08);
         const translationZ = view.getFloat32(gobjTableIdx + 0x0C);
-        const rotationX = view.getFloat32(gobjTableIdx + 0x10) * MathConstants.RAD_TO_DEG;
-        const rotationY = view.getFloat32(gobjTableIdx + 0x14) * MathConstants.RAD_TO_DEG;
-        const rotationZ = view.getFloat32(gobjTableIdx + 0x18) * MathConstants.RAD_TO_DEG;
+        const rotationX = view.getFloat32(gobjTableIdx + 0x10) * Math.PI / 180;
+        const rotationY = view.getFloat32(gobjTableIdx + 0x14) * Math.PI / 180;
+        const rotationZ = view.getFloat32(gobjTableIdx + 0x18) * Math.PI / 180;
         const scaleX = view.getFloat32(gobjTableIdx + 0x1C);
         const scaleY = view.getFloat32(gobjTableIdx + 0x20);
         const scaleZ = view.getFloat32(gobjTableIdx + 0x24);
@@ -192,11 +203,149 @@ function parseKMP(buffer: ArrayBufferSlice): KMP {
 
     return { gobj };
 }
+// Based on https://github.com/riidefi/MKWDecompilation/blob/master/EGG/posteffect/Lighting/res_blight.hpp
+class EGGLightObject {
+    public SpotlightFunction: Number;
+    public DistanceFunction: Number;
+    public LightType: Number;
+    public XFormMode: Number;
+    public AmbientIndex: Number;
+    public LightingFlag: Number;
 
+    public Position = vec3.create();
+    public Aim = vec3.create();
+    
+    public ColorScale: Number; // f32
+    public Color = colorNew(1, 1, 1, 1);
+    public SpecularColor = colorNew(1, 1, 1, 1);
+
+    public SpotlightCutoffAngle: Number; // f32
+    public ReferenceDistance: Number; // f32
+    public ReferenceBrightness: Number; // f32
+
+    public setFromBlobj(buffer: ArrayBufferSlice): void {
+        const view = buffer.createDataView();
+        
+        assert(readString(buffer, 0x00, 0x04) === 'LOBJ');
+        
+        // filesize at 0x04
+
+        // Rev 2 will be slightly different
+        // assert(view.getUint8(0x08) === 3);
+
+        this.SpotlightFunction = view.getUint8(0x10);
+        this.DistanceFunction = view.getUint8(0x11);
+        this.LightType = view.getUint8(0x12);
+        this.XFormMode = view.getUint8(0x13);
+
+        this.AmbientIndex = view.getUint16(0x14);
+        this.LightingFlag = view.getUint16(0x16);
+
+    }
+    // EGG light objects can compile down to GX and NW4R G3D lights.
+    // This is based on the decompilation of the GX function.
+    // https://github.com/riidefi/MKWDecompilation/blob/master/EGG/posteffect/Lighting/blight.cpp#L98
+    public setLight(dst: Light, camera: Camera): void {
+
+        // Flag 1 enables/disables the light altogether.
+        // However, in the functions to send lights to GX and G3D, a check against flag 64 and 32 respectively is performed.
+        // For now, GX and G3D prohibition flags are ignored. 
+        if ((this.LightingFlag & 1) == 0)
+        {
+            colorFromRGBA(dst.Color, 0, 0, 0, 0xFF);
+            return;
+        }
+
+        // The light color is scaled before it is used. While in game, this value is computed on load,
+        // here it is computed every frame.
+        // Additionally, alpha is not affected and colors are clamped at 255. (L266)
+        
+        var scaledColor = vec3.fromValues(
+            this.Color.r * this.ColorScale,
+            this.Color.g * this.ColorScale,
+            this.Color.b * this.ColorScale
+        );
+
+        colorFromRGBA(dst.Color,
+            scaledColor[0] <= 255 ? scaledColor[0] : 255,
+            scaledColor[1] <= 255 ? scaledColor[1] : 255,
+            scaledColor[2] <= 255 ? scaledColor[2] : 255,
+            this.Color.a
+        );
+        
+        // When sending to G3D, two flags control whether or not to set the light color or alpha. These are ignored.
+
+        switch(this.XFormMode)
+        {
+            case 0:
+                // (really LightObject+0x8C)
+                dst.Position = this.Position;
+                // directionless
+                vec3.set(dst.Direction, 0, 0, 0);
+                break;
+            case 1:
+                // Paired single madness D:
+                // TODO
+                break;
+            case 2:
+                // (really LightObject+0x8C)
+                dst.Position = this.Position;
+                // (really LightObject+0xA4)
+                dst.Direction = this.Aim;
+                break;
+        }
+        // TODO: handle special flags
+    }
+}
+// Loaded from a BLIGHT
+class EGGLightManager
+{
+    LightObjects: EGGLightObject[];
+    AmbientLightObjects: Color[];
+    
+    public setOnModelInstance(modelInstance: MDL0ModelInstance, camera: Camera): void {
+        let i = 0;
+        for(var light of this.LightObjects)
+            light.setLight(modelInstance.getGXLightReference(i++), camera);
+        // TODO(riidefi): Support ambient lights
+    }
+}
+function loadBlight(buffer: ArrayBufferSlice): EGGLightManager {
+    const view = buffer.createDataView();
+    
+    assert(readString(buffer, 0x00, 0x04) === 'LGHT');
+    // ignore filesize at 0x04
+    
+    // Only support for revision 2
+    assert(view.getUint8(0x08) === 2);
+
+    var man = new EGGLightManager;
+
+    const numLobjs = view.getUint16(0x10);
+    const numAmb = view.getUint16(0x12);
+
+    man.LightObjects = [];
+    man.AmbientLightObjects = [];
+
+    for(var i = 0; i < numLobjs; i++)
+    {
+        man.LightObjects.push(new EGGLightObject);  
+        man.LightObjects[i].setFromBlobj(buffer.slice(0x28 + 0x50 * i));
+    }
+
+    for(var i = 0; i < numAmb; i++)
+    {
+        const buf = buffer.slice(0x28 + 0x50 * numLobjs + 4 * i).createDataView();
+        man.AmbientLightObjects.push(new Color(buf.getUint8(0), buf.getUint8(1), buf.getUint8(2), buf.getUint8(3)));
+    }
+
+    return man;
+}
 const scaleFactor = 0.1;
 const posMtx = mat4.fromScaling(mat4.create(), [scaleFactor, scaleFactor, scaleFactor]);
 
 class MarioKartWiiSceneDesc implements Viewer.SceneDesc {
+    
     constructor(public id: string, public name: string) {}
 
     private static spawnObjectFromRRES(device: GfxDevice, renderer: MarioKartWiiRenderer, rres: BRRES.RRES, objectName: string): MDL0ModelInstance {
@@ -218,7 +367,7 @@ class MarioKartWiiSceneDesc implements Viewer.SceneDesc {
         const spawnObject = (objectName: string): MDL0ModelInstance => {
             const rres = getRRES(objectName);
             const b = this.spawnObjectFromRRES(device, renderer, rres, objectName);
-            computeModelMatrixSRT(b.modelMatrix, gobj.scaleX, gobj.scaleY, gobj.scaleZ, gobj.rotationX, gobj.rotationY, gobj.rotationZ, gobj.translationX, gobj.translationY, gobj.translationZ);
+            calcModelMtx(b.modelMatrix, gobj.scaleX, gobj.scaleY, gobj.scaleZ, gobj.rotationX, gobj.rotationY, gobj.rotationZ, gobj.translationX, gobj.translationY, gobj.translationZ);
             mat4.mul(b.modelMatrix, posMtx, b.modelMatrix);
             return b;
         };
@@ -683,6 +832,9 @@ class MarioKartWiiSceneDesc implements Viewer.SceneDesc {
 
         for (let i = 0; i < kmp.gobj.length; i++)
             this.spawnObjectFromKMP(device, renderer, arc, kmp.gobj[i]);
+        
+        // TODO: a default light is loaded from Common.szs if this does not exist.
+        renderer.LightManager = loadBlight(arc.findFileData('./posteffect/posteffect.blight'));
 
         renderer.renderHelper.finishBuilder(device, renderer.viewRenderer);
 
