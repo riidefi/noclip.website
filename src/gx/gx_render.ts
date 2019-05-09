@@ -41,7 +41,7 @@ export class MaterialParams {
     public u_TexMtx: mat4[] = nArray(10, () => mat4.create());     // mat4x3
     public u_PostTexMtx: mat4[] = nArray(20, () => mat4.create()); // mat4x3
     public u_IndTexMtx: mat4[] = nArray(3, () => mat4.create()); // mat4x2
-    public u_Lights: GX_Material.Light[] = nArray(8, () => new GX_Material.Light());
+    public u_Lights: GX_Material.Light[] = nArray(16, () => new GX_Material.Light());
 }
 
 export class PacketParams {

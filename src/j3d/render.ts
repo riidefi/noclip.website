@@ -144,7 +144,7 @@ export class ShapeInstance {
 }
 
 export class MaterialInstanceState {
-    public lights = nArray(8, () => new GX_Material.Light());
+    public lights = nArray(16, () => new GX_Material.Light());
 }
 
 function mat4SwapTranslationColumns(m: mat4): void {

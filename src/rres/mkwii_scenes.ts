@@ -15,11 +15,11 @@ import { mat4, vec3 } from 'gl-matrix';
 import { RRESTextureHolder, MDL0Model, MDL0ModelInstance } from './render';
 import AnimationController from '../AnimationController';
 import { GXRenderHelperGfx } from '../gx/gx_render';
-import { EFB_WIDTH, EFB_HEIGHT, Light, lightSetWorldPosition, lightSetWorldDirection, Color } from '../gx/gx_material';
+import { EFB_WIDTH, EFB_HEIGHT, Light, lightSetWorldPosition, lightSetWorldDirection, Color, initLightSpot } from '../gx/gx_material';
 import { GfxDevice, GfxHostAccessPass, GfxRenderPass } from '../gfx/platform/GfxPlatform';
 import { GfxRenderInstViewRenderer } from '../gfx/render/GfxRenderer';
 import { BasicRenderTarget, transparentBlackFullClearRenderPassDescriptor } from '../gfx/helpers/RenderTargetHelpers';
-import { calcModelMtx } from '../oot3d/cmb';
+import { computeModelMatrixSRT, MathConstants } from '../MathHelpers';
 import { fillVec3 } from '../gfx/helpers/UniformBufferHelpers';
 import { colorNew, colorFromRGBA } from '../Color';
 import { Camera } from '../Camera';
@@ -176,9 +176,9 @@ function parseKMP(buffer: ArrayBufferSlice): KMP {
         const translationX = view.getFloat32(gobjTableIdx + 0x04);
         const translationY = view.getFloat32(gobjTableIdx + 0x08);
         const translationZ = view.getFloat32(gobjTableIdx + 0x0C);
-        const rotationX = view.getFloat32(gobjTableIdx + 0x10) * Math.PI / 180;
-        const rotationY = view.getFloat32(gobjTableIdx + 0x14) * Math.PI / 180;
-        const rotationZ = view.getFloat32(gobjTableIdx + 0x18) * Math.PI / 180;
+        const rotationX = view.getFloat32(gobjTableIdx + 0x10) * MathConstants.RAD_TO_DEG;
+        const rotationY = view.getFloat32(gobjTableIdx + 0x14) * MathConstants.RAD_TO_DEG;
+        const rotationZ = view.getFloat32(gobjTableIdx + 0x18) * MathConstants.RAD_TO_DEG;
         const scaleX = view.getFloat32(gobjTableIdx + 0x1C);
         const scaleY = view.getFloat32(gobjTableIdx + 0x20);
         const scaleZ = view.getFloat32(gobjTableIdx + 0x24);
@@ -203,25 +203,50 @@ function parseKMP(buffer: ArrayBufferSlice): KMP {
 
     return { gobj };
 }
+
+
 // Based on https://github.com/riidefi/MKWDecompilation/blob/master/EGG/posteffect/Lighting/res_blight.hpp
+
+// MKW only uses 0x641 and 0x621
+// > '0b100000000000' (2048/LIGHT_FLAG_USE_SHININESS_INSTEAD)
+// > '0b011001000001' (0x641) FLAG_1 | LIGHT_FLAG_64 | LIGHT_FLAG_ENABLE_G3D_LIGHTCOLOR | LIGHT_FLAG_ENABLE_G3D_LIGHTALPHA
+// > '0b011000100001' (0x621) FLAG_1 | LIGHT_FLAG_32 | LIGHT_FLAG_ENABLE_G3D_LIGHTCOLOR | LIGHT_FLAG_ENABLE_G3D_LIGHTALPHA
+enum LightingFlags
+{
+    LIGHT_FLAG_1 = (1 << 0), //!< [1] Unknown. If not set, only initializes light color to pure black (disable?)
+    LIGHT_FLAG_2 = (1 << 1),
+    LIGHT_FLAG_4 = (1 << 2),
+    LIGHT_FLAG_8 = (1 << 3),
+    LIGHT_FLAG_16 = (1 << 4),
+    LIGHT_FLAG_32 = (1 << 5),
+    LIGHT_FLAG_64 = (1 << 6), //!< [64, 0x40] Unknown. If not set, only initializes light color to pure black (disable?)
+    LIGHT_FLAG_SPOTLIGHT = (1 << 7), //!< [128, 0x80] when enabled, use GXInitLightSpot rather than GXInitLightAttnA
+    LIGHT_FLAG_MANUAL_DISTANCE_ATTN = (1 << 8), //!< [256] when enabled, use manual k0, k1, k2 for distance attenuation (GXInitLightAttnK). otherwise, use GXInitLightDistAttn.
+    LIGHT_FLAG_ENABLE_G3D_LIGHTCOLOR = (1 << 9), //!< [512] 8022BF70 - unset, set disable color flag in g3d lightobject. Doesn't affect player.
+    LIGHT_FLAG_ENABLE_G3D_LIGHTALPHA = (1 << 10), //!< [1024] 8022BF8C - when unset, set disable alpha flag in g3d lightobject. Doesn't affect player.
+    LIGHT_FLAG_USE_SHININESS_INSTEAD = (1 << 11) //!< [2048] When set, overwrite previous settings with GXInitLightShininess based on mShininess. Affects GX and G3D.
+};
+
 class EGGLightObject {
-    public SpotlightFunction: Number;
-    public DistanceFunction: Number;
-    public LightType: Number;
-    public XFormMode: Number;
-    public AmbientIndex: Number;
-    public LightingFlag: Number;
+    public SpotlightFunction: number;
+    public DistanceFunction: number;
+    public LightType: number;
+    public XFormMode: number;
+    public AmbientIndex: number;
+    public LightingFlag: number;
 
     public Position = vec3.create();
     public Aim = vec3.create();
     
-    public ColorScale: Number; // f32
+    public ColorScale: number; // f32
     public Color = colorNew(1, 1, 1, 1);
     public SpecularColor = colorNew(1, 1, 1, 1);
 
-    public SpotlightCutoffAngle: Number; // f32
-    public ReferenceDistance: Number; // f32
-    public ReferenceBrightness: Number; // f32
+    public SpotlightCutoffAngle: number; // f32
+    public ReferenceDistance: number; // f32
+    public ReferenceBrightness: number; // f32
+
+
 
     public setFromBlobj(buffer: ArrayBufferSlice): void {
         const view = buffer.createDataView();
@@ -294,8 +319,35 @@ class EGGLightObject {
                 dst.Direction = this.Aim;
                 break;
         }
-        // TODO: handle special flags
-    }
+
+        // Manual attenuation values aren't set in the blight file.
+        // Rather, they are fallback values in runtime light object.
+
+        if ((this.LightingFlag & LightingFlags.LIGHT_FLAG_SPOTLIGHT) != 0)
+            initLightSpot(dst, this.SpotlightCutoffAngle > 0.0 ? this.SpotlightCutoffAngle : 0.0001, this.SpotlightFunction);
+	    else
+            // GXInitLightAttnA(pObj, mAngularAttnCoefficients[0], mAngularAttnCoefficients[1], mAngularAttnCoefficients[2]);
+            // TODO(riidefi): Grab MKW defaults
+            {}
+        
+        if ((this.LightingFlag & LightingFlags.LIGHT_FLAG_MANUAL_DISTANCE_ATTN) != 0)
+            // TODO(riidefi): Grab MKW defaults
+            {} // GXInitLightAttnK(pObj, mDistanceAttnCoefficients[0], mDistanceAttnCoefficients[1], mDistanceAttnCoefficients[2]);
+        else
+        {
+            // assert(0.0 < this.ReferenceBrightness && this.ReferenceBrightness < 1.0);
+            // The reference distance is actually scaled by the light ref dist scale.
+            // However, this is always 1.0.
+            // TODO(riidefi): finish this
+            // GXInitLightDistAttn(pObj, this.ReferenceDistance, this.ReferenceBrightness, this.DistanceFunction);
+        }
+
+        if ((this.LightingFlag & LightingFlags.LIGHT_FLAG_USE_SHININESS_INSTEAD) != 0)
+        {
+            // GXInitLightShininess(pObj, 16.0); // mShininess member
+            dst.CosAtten.set(0.0, 0.0, 1.0);
+            dst.DistAtten.set(8.0, 0.0, -7.0);
+        }
 }
 // Loaded from a BLIGHT
 class EGGLightManager
@@ -306,7 +358,14 @@ class EGGLightManager
     public setOnModelInstance(modelInstance: MDL0ModelInstance, camera: Camera): void {
         let i = 0;
         for(var light of this.LightObjects)
+        {
+            assert(modelInstance.getGXLightReference(i) !== undefined);
+
             light.setLight(modelInstance.getGXLightReference(i++), camera);
+            // TODO(riidefi): Expand this
+            if (i > 8)
+                break;
+        }
         // TODO(riidefi): Support ambient lights
     }
 }
@@ -367,7 +426,7 @@ class MarioKartWiiSceneDesc implements Viewer.SceneDesc {
         const spawnObject = (objectName: string): MDL0ModelInstance => {
             const rres = getRRES(objectName);
             const b = this.spawnObjectFromRRES(device, renderer, rres, objectName);
-            calcModelMtx(b.modelMatrix, gobj.scaleX, gobj.scaleY, gobj.scaleZ, gobj.rotationX, gobj.rotationY, gobj.rotationZ, gobj.translationX, gobj.translationY, gobj.translationZ);
+            computeModelMatrixSRT(b.modelMatrix, gobj.scaleX, gobj.scaleY, gobj.scaleZ, gobj.rotationX, gobj.rotationY, gobj.rotationZ, gobj.translationX, gobj.translationY, gobj.translationZ);
             mat4.mul(b.modelMatrix, posMtx, b.modelMatrix);
             return b;
         };

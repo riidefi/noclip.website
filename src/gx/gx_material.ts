@@ -9,6 +9,7 @@ import { GfxFormat } from '../gfx/platform/GfxPlatformFormat';
 import { GfxCompareMode, GfxFrontFaceMode, GfxBlendMode, GfxBlendFactor, GfxCullMode, GfxMegaStateDescriptor } from '../gfx/platform/GfxPlatform';
 import { vec3, vec4, mat4 } from 'gl-matrix';
 import { Camera } from '../Camera';
+import { MathConstants } from '../MathHelpers';
 
 // TODO(jstpierre): Move somewhere better...
 export const EFB_WIDTH = 640;
@@ -1176,4 +1177,58 @@ export function getRasColorChannelID(v: GX.ColorChannelId): GX.RasColorChannelID
     default:
         throw "whoops";
     }
+}
+// Based on https://github.com/devkitPro/libogc/blob/master/libogc/gx.c#L4775
+export function initLightSpot(dst: Light, cutoff : number, spotfn : GX.SpotlightFunction)
+{
+    if(cutoff < 0.0 || cutoff > 90.0)
+        spotfn = GX.SpotlightFunction.OFF;
+
+	const r = cutoff * MathConstants.RAD_TO_DEG;
+    const cr = Math.cos(r);
+    
+    let a0, a1, a2, d = 0;
+
+	switch(spotfn) {
+		case GX.SpotlightFunction.FLAT:
+			a0 = -1000.0*cr;
+			a1 = 1000.0;
+			a2 = 0.0;
+			break;
+		case GX.SpotlightFunction.COS:
+			a0 = -cr/(1.0-cr);
+			a1 = 1.0/(1.0-cr);
+			a2 = 0.0;
+			break;
+		case GX.SpotlightFunction.COS2:
+			a0 = 0.0;
+			a1 = -cr/(1.0-cr);
+			a2 = 1.0/(1.0-cr);
+			break;
+		case GX.SpotlightFunction.SHARP:
+			d = (1.0-cr)*(1.0-cr);
+			a0 = cr*(cr-2.0);
+			a1 = 2.0/d;
+			a2 = -1.0/d;
+			break;
+		case GX.SpotlightFunction.RING1:
+			d = (1.0-cr)*(1.0-cr);
+			a0 = -4.0*cr/d;
+			a1 = 4.0*(1.0+cr)/d;
+			a2 = -4.0/d;
+			break;
+		case GX.SpotlightFunction.RING2:
+			d = (1.0-cr)*(1.0-cr);
+			a0 = 1.0-2.0*cr*cr/d;
+			a1 = 4.0*cr/d;
+			a2 = -2.0/d;
+			break;
+		case GX.SpotlightFunction.OFF:
+		default:
+			a0 = 1.0;
+			a1 = 0.0;
+			a2 = 0.0;
+			break;
+	}
+    dst.CosAtten.set(a0, a1, a2);
 }

@@ -638,3 +638,13 @@ export const enum AttenuationFunction {
     SPOT = 0x01, // Distance/spotlight attenuation
     NONE,
 }
+export const enum SpotlightFunction
+{
+    OFF = 0,
+    FLAT,
+    COS,
+    COS2,
+    SHARP,
+    RING1,
+    RING2
+}
